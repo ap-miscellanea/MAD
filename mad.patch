@@ -1,0 +1,460 @@
+From 50261284a5486d1974adb202eb84e5ed782d3665 Mon Sep 17 00:00:00 2001
+From: Peter Rabbitson <ribasushi@cpan.org>
+Date: Tue, 11 Jan 2011 19:14:07 +0100
+Subject: [PATCH] Introduce M.A.D. within the schema/source instance linkage
+
+When a source instance is registered with a schema instance, the code
+in Schema::_register_source() adds a strong ref of the source to the
+schema register, and a weak schema ref to the source itself. Install
+DESTROY handlers both on Schema and ResultSource to flip this setup
+any time the Schema instance goes out of scope (if we somehow
+increment the refcount of $self in a DESTROY, then the garbage
+collection is aborted). Tested all the way back to 5.8.1 with excellent
+results.
+
+Promote the source links in both ResultSet and Row to real ResultSource
+instance refs, as there's no longer any issue with memory leaks (before
+a source handle would be instantiated lazily to sidestep the source
+object entirely by keeping a schema ref instead).
+
+Add freeze/thaw hooks for proper serialization of Source-containing
+structures (be it Row's or ResultSet's). In another round of cleanup
+ResultSourceHandle will be reduced to purely a "no schema yet"
+placeholder after schema-less a freeze/thaw cycle.
+---
+ Changes                        |    4 +++
+ lib/DBIx/Class/ResultSet.pm    |   29 +++++-------------
+ lib/DBIx/Class/ResultSource.pm |   52 +++++++++++++++++++++++++++++++
+ lib/DBIx/Class/Row.pm          |   66 ++++++++++++++--------------------------
+ lib/DBIx/Class/Schema.pm       |   24 +++++++++++++++
+ t/52leaks.t                    |   47 ++++++++++++++++++++++++----
+ xt/podcoverage.t               |    2 ++
+ 7 files changed, 154 insertions(+), 70 deletions(-)
+
+diff --git a/Changes b/Changes
+index b250b33..a2d952c 100644
+--- a/Changes
++++ b/Changes
+@@ -1,5 +1,9 @@
+ Revision history for DBIx::Class
+ 
++    * New Features / Changes
++        - Schema/resultsource instances are now crossreferenced via a new
++          system guaranteeing leak-free mutually assuered destruction
++
+     * Fixes
+         - Revert default selection to being lazy again (eagerness introduced
+           in 0.08125) - fixes DBIx::Class::Helper::ResultSet::RemoveColumns
+diff --git a/lib/DBIx/Class/ResultSet.pm b/lib/DBIx/Class/ResultSet.pm
+index 0793e05..af8e545 100644
+--- a/lib/DBIx/Class/ResultSet.pm
++++ b/lib/DBIx/Class/ResultSet.pm
+@@ -6,7 +6,6 @@ use base qw/DBIx::Class/;
+ use Carp::Clan qw/^DBIx::Class/;
+ use DBIx::Class::Exception;
+ use Data::Page;
+-use Storable;
+ use DBIx::Class::ResultSetColumn;
+ use DBIx::Class::ResultSourceHandle;
+ use Hash::Merge ();
+@@ -31,7 +30,7 @@ use overload
+         'bool'   => "_bool",
+         fallback => 1;
+ 
+-__PACKAGE__->mk_group_accessors('simple' => qw/_result_class _source_handle/);
++__PACKAGE__->mk_group_accessors('simple' => qw/_result_class result_source/);
+ 
+ =head1 NAME
+ 
+@@ -197,8 +196,8 @@ sub new {
+   return $class->new_result(@_) if ref $class;
+ 
+   my ($source, $attrs) = @_;
+-  $source = $source->handle
+-    unless $source->isa('DBIx::Class::ResultSourceHandle');
++  $source = $source->resolve
++    if $source->isa('DBIx::Class::ResultSourceHandle');
+   $attrs = { %{$attrs||{}} };
+ 
+   if ($attrs->{page}) {
+@@ -210,16 +209,16 @@ sub new {
+   # Creation of {} and bless separated to mitigate RH perl bug
+   # see https://bugzilla.redhat.com/show_bug.cgi?id=196836
+   my $self = {
+-    _source_handle => $source,
++    result_source => $source,
+     cond => $attrs->{where},
+     pager => undef,
+-    attrs => $attrs
++    attrs => $attrs,
+   };
+ 
+   bless $self, $class;
+ 
+   $self->result_class(
+-    $attrs->{result_class} || $source->resolve->result_class
++    $attrs->{result_class} || $source->result_class
+   );
+ 
+   return $self;
+@@ -2278,7 +2277,6 @@ sub new_result {
+     @$cols_from_relations
+       ? (-cols_from_relations => $cols_from_relations)
+       : (),
+-    -source_handle => $self->_source_handle,
+     -result_source => $self->result_source, # DO NOT REMOVE THIS, REQUIRED
+   );
+ 
+@@ -3615,17 +3613,6 @@ sub _merge_joinpref_attr {
+   }
+ }
+ 
+-sub result_source {
+-    my $self = shift;
+-
+-    if (@_) {
+-        $self->_source_handle($_[0]->handle);
+-    } else {
+-        $self->_source_handle->resolve;
+-    }
+-}
+-
+-
+ sub STORABLE_freeze {
+   my ($self, $cloning) = @_;
+   my $to_serialize = { %$self };
+@@ -3655,8 +3642,8 @@ See L<DBIx::Class::Schema/throw_exception> for details.
+ sub throw_exception {
+   my $self=shift;
+ 
+-  if (ref $self && $self->_source_handle->schema) {
+-    $self->_source_handle->schema->throw_exception(@_)
++  if (ref $self and my $rsrc = $self->result_source) {
++    $rsrc->throw_exception(@_)
+   }
+   else {
+     DBIx::Class::Exception->throw(@_);
+diff --git a/lib/DBIx/Class/ResultSource.pm b/lib/DBIx/Class/ResultSource.pm
+index e7ab22d..821f5cb 100644
+--- a/lib/DBIx/Class/ResultSource.pm
++++ b/lib/DBIx/Class/ResultSource.pm
+@@ -10,6 +10,8 @@ use DBIx::Class::Exception;
+ use Carp::Clan qw/^DBIx::Class/;
+ use Try::Tiny;
+ use List::Util 'first';
++use Scalar::Util qw/weaken isweak/;
++use Storable qw/nfreeze thaw/;
+ use namespace::clean;
+ 
+ use base qw/DBIx::Class/;
+@@ -1742,6 +1744,56 @@ sub handle {
+     });
+ }
+ 
++{
++  my $global_phase_destroy;
++
++  END { $global_phase_destroy++ }
++
++  sub DESTROY {
++    return if $global_phase_destroy;
++
++######
++# !!! ACHTUNG !!!!
++######
++#
++# Under no circumstances shall $_[0] be stored anywhere else (like copied to
++# a lexical variable, or shifted, or anything else). Doing so will mess up
++# the refcount of this particular result source, and will allow the $schema
++# we are trying to save to reattach back to the source we are destroying.
++# The relevant code checking refcounts is in ::Schema::DESTROY()
++
++    # if we are not a schema instance holder - we don't matter
++    return if(
++      ! ref $_[0]->{schema}
++        or
++      isweak $_[0]->{schema}
++    );
++
++    # weaken our schema hold forcing the schema to find somewhere else to live
++    weaken $_[0]->{schema};
++
++    # if schema is still there reintroduce ourselves with strong refs back
++    if ($_[0]->{schema}) {
++      my $srcregs = $_[0]->{schema}->source_registrations;
++      for (keys %$srcregs) {
++        $srcregs->{$_} = $_[0] if $srcregs->{$_} == $_[0];
++      }
++    }
++  }
++}
++
++sub STORABLE_freeze {
++  my ($self, $cloning) = @_;
++  nfreeze($self->handle);
++}
++
++sub STORABLE_thaw {
++  my ($self, $cloning, $ice) = @_;
++  %$self = %{ (thaw $ice)->resolve };
++}
++
++
++
+ =head2 throw_exception
+ 
+ See L<DBIx::Class::Schema/"throw_exception">.
+diff --git a/lib/DBIx/Class/Row.pm b/lib/DBIx/Class/Row.pm
+index 2713869..5b350bd 100644
+--- a/lib/DBIx/Class/Row.pm
++++ b/lib/DBIx/Class/Row.pm
+@@ -21,7 +21,7 @@ BEGIN {
+       : sub () { 0 };
+ }
+ 
+-__PACKAGE__->mk_group_accessors('simple' => qw/_source_handle/);
++__PACKAGE__->mk_group_accessors('simple' => [result_source => '_result_source']);
+ 
+ =head1 NAME
+ 
+@@ -64,12 +64,12 @@ this class, you are better off calling it on a
+ L<DBIx::Class::ResultSet> object.
+ 
+ When calling it directly, you will not get a complete, usable row
+-object until you pass or set the C<source_handle> attribute, to a
++object until you pass or set the C<result_source> attribute, to a
+ L<DBIx::Class::ResultSource> instance that is attached to a
+ L<DBIx::Class::Schema> with a valid connection.
+ 
+ C<$attrs> is a hashref of column name, value data. It can also contain
+-some other attributes such as the C<source_handle>.
++some other attributes such as the C<result_source>.
+ 
+ Passing an object, or an arrayref of objects as a value will call
+ L<DBIx::Class::Relationship::Base/set_from_related> for you. When
+@@ -160,19 +160,14 @@ sub new {
+   my ($class, $attrs) = @_;
+   $class = ref $class if ref $class;
+ 
+-  my $new = {
+-      _column_data          => {},
+-  };
+-  bless $new, $class;
+-
+-  if (my $handle = delete $attrs->{-source_handle}) {
+-    $new->_source_handle($handle);
+-  }
++  my $new = bless { _column_data => {} }, $class;
+ 
+-  my $source;
+-  if ($source = delete $attrs->{-result_source}) {
+-    $new->result_source($source);
+-  }
++  my $source =
++    delete $attrs->{-result_source}
++      or
++    ( $attrs->{-source_handle} and (delete $attrs->{-source_handle})->resolve )
++  ;
++  $new->result_source($source) if $source;
+ 
+   if (my $related = delete $attrs->{-cols_from_relations}) {
+     @{$new->{_ignore_at_insert}={}}{@$related} = ();
+@@ -821,9 +816,13 @@ sub _is_column_numeric {
+     my $colinfo = $self->column_info ($column);
+ 
+     # cache for speed (the object may *not* have a resultsource instance)
+-    if (! defined $colinfo->{is_numeric} && $self->_source_handle) {
++    if (
++      ! defined $colinfo->{is_numeric}
++        and
++      my $storage = try { $self->result_source->schema->storage }
++    ) {
+       $colinfo->{is_numeric} =
+-        $self->result_source->schema->storage->is_datatype_numeric ($colinfo->{data_type})
++        $storage->is_datatype_numeric ($colinfo->{data_type})
+           ? 1
+           : 0
+         ;
+@@ -1142,20 +1141,13 @@ L<DBIx::Class::ResultSet>, see L<DBIx::Class::ResultSet/result_class>.
+ sub inflate_result {
+   my ($class, $source, $me, $prefetch) = @_;
+ 
+-  my ($source_handle) = $source;
+-
+-  if ($source->isa('DBIx::Class::ResultSourceHandle')) {
+-    $source = $source_handle->resolve
+-  }
+-  else {
+-    $source_handle = $source->handle
+-  }
++  $source = $source->resolve
++    if $source->isa('DBIx::Class::ResultSourceHandle');
+ 
+-  my $new = {
+-    _source_handle => $source_handle,
+-    _column_data => $me,
+-  };
+-  bless $new, (ref $class || $class);
++  my $new = bless
++    { _column_data => $me, _result_source => $source },
++    ref $class || $class
++  ;
+ 
+   foreach my $pre (keys %{$prefetch||{}}) {
+ 
+@@ -1290,7 +1282,7 @@ sub is_column_changed {
+ 
+ =over
+ 
+-=item Arguments: none
++=item Arguments: $result_source_instance
+ 
+ =item Returns: a ResultSource instance
+ 
+@@ -1298,18 +1290,6 @@ sub is_column_changed {
+ 
+ Accessor to the L<DBIx::Class::ResultSource> this object was created from.
+ 
+-=cut
+-
+-sub result_source {
+-    my $self = shift;
+-
+-    if (@_) {
+-        $self->_source_handle($_[0]->handle);
+-    } else {
+-        $self->_source_handle->resolve;
+-    }
+-}
+-
+ =head2 register_column
+ 
+   $column_info = { .... };
+diff --git a/lib/DBIx/Class/Schema.pm b/lib/DBIx/Class/Schema.pm
+index 3c78930..8270c27 100644
+--- a/lib/DBIx/Class/Schema.pm
++++ b/lib/DBIx/Class/Schema.pm
+@@ -11,6 +11,7 @@ use File::Spec;
+ use Sub::Name 'subname';
+ use Module::Find();
+ use Storable();
++use B qw/svref_2object/;
+ use namespace::clean;
+ 
+ use base qw/DBIx::Class/;
+@@ -1372,6 +1373,29 @@ sub _register_source {
+   $self->class_mappings(\%map);
+ }
+ 
++{
++  my $global_phase_destroy;
++
++  END { $global_phase_destroy++ }
++
++  sub DESTROY {
++    return if $global_phase_destroy;
++
++    my $self = shift;
++    my $srcs = $self->source_registrations;
++
++    for my $moniker (keys %$srcs) {
++      # find first source that is not about to be GCed (someone other than $self
++      # holds a reference to it) and reattach to it, weakening our own link
++      if (ref $srcs->{$moniker} and svref_2object($srcs->{$moniker})->REFCNT > 1) {
++        $srcs->{$moniker}->schema($self);
++        weaken $srcs->{$moniker};
++        last;
++      }
++    }
++  }
++}
++
+ sub _unregister_source {
+     my ($self, $moniker) = @_;
+     my %reg = %{$self->source_registrations};
+diff --git a/t/52leaks.t b/t/52leaks.t
+index 4f75810..f8cd1c3 100644
+--- a/t/52leaks.t
++++ b/t/52leaks.t
+@@ -1,6 +1,3 @@
+-use strict;
+-use warnings;
+-
+ # Do the override as early as possible so that CORE::bless doesn't get compiled away
+ # We will replace $bless_override only if we are in author mode
+ my $bless_override;
+@@ -11,6 +8,8 @@ BEGIN {
+   *CORE::GLOBAL::bless = sub { goto $bless_override };
+ }
+ 
++use strict;
++use warnings;
+ use Test::More;
+ 
+ use lib qw(t/lib);
+@@ -171,11 +170,47 @@ unless (DBICTest::RunMode->is_plain) {
+     $weak_registry->{"basic $_"} = { weakref => $base_collection->{$_} };
+     weaken $weak_registry->{"basic $_"}{weakref};
+   }
+-
+ }
+ 
+-memory_cycle_ok($weak_registry, 'No cycles in the weakened object collection')
+-  if $have_test_cycle;
++# check that "phantom-chaining" works - we never lose track of the original $schema
++# and have access to the entire tree without leaking anything
++{
++  my $phantom;
++  for (
++    sub { DBICTest->init_schema },
++    sub { shift->source('Artist') },
++    sub { shift->resultset },
++    sub { shift->result_source },
++    sub { shift->schema },
++    sub { shift->resultset('Artist') },
++    sub { shift->find_or_create({ name => 'detachable' }) },
++    sub { shift->result_source },
++    sub { shift->schema },
++    sub { shift->clone },
++    sub { shift->resultset('Artist') },
++    sub { shift->next },
++    sub { shift->result_source },
++    sub { shift->resultset },
++    sub { shift->create({ name => 'detached' }) },
++    sub { shift->update({ name => 'reattached' }) },
++    sub { shift->discard_changes },
++    sub { shift->delete },
++    sub { shift->insert },
++  ) {
++    $phantom = $_->($phantom);
++
++    my $slot = (sprintf 'phantom %s=%s(0x%x)', # so we don't trigger stringification
++      ref $phantom,
++      reftype $phantom,
++      refaddr $phantom,
++    );
++    $weak_registry->{$slot} = $phantom;
++    weaken $weak_registry->{$slot};
++  }
++
++  ok( $phantom->in_storage, 'Properly deleted/reinserted' );
++  is( $phantom->name, 'reattached', 'Still correct name' );
++}
+ 
+ # Naturally we have some exceptions
+ my $cleared;
+diff --git a/xt/podcoverage.t b/xt/podcoverage.t
+index 574efb6..022e320 100644
+--- a/xt/podcoverage.t
++++ b/xt/podcoverage.t
+@@ -68,6 +68,8 @@ my $exceptions = {
+             resolve_condition
+             resolve_join
+             resolve_prefetch
++            STORABLE_freeze
++            STORABLE_thaw
+         /],
+     },
+     'DBIx::Class::ResultSet' => {
+-- 
+1.7.10
