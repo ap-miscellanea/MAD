@@ -48,27 +48,24 @@ sub DESTROY {
 	$num_destroyed++;
 }
 
+sub as_sublist { $_[0][NAME], $_[0][NEXT] ? $_[0][NEXT]->as_sublist : () }
+sub as_list { $_[0][PREV] ? $_[0][PREV]->as_list : $_[0]->as_sublist }
+
 package main;
 
 use Test::More;
 
 ( my $ll = LL->new( 'foo' ) )->insert_after( 'bar' )->insert_after( 'baz' );
 
-my $num_total = 0;
+my $num_total = () = $ll->as_list;
+my $dump = join ' -> ', $ll->as_list;
 
-diag join ' -> ', do {
-	my @name;
-	my $i = $ll;
-	while ( $i ) {
-		++$num_total;
-		push @name, $i->name;
-		$i = $i->next;
-	}
-	@name;
-};
+diag $dump;
 
 $ll = $ll->next->next;
 is $num_destroyed, 0, 'staying alive';
+
+is +(join ' -> ', $ll->as_list), $dump, 'no bodily harm';
 
 undef $ll;
 is $num_destroyed, $num_total, 'DJ left the house';
